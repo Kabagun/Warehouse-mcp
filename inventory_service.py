@@ -64,9 +64,11 @@ class InventoryService:
             raise ValueError("Склад не найден или недоступен.")
         return store
 
-    def list_items(self, store_id: int, *, include_inactive: bool = False) -> list[InventoryItem]:
+    def list_items(
+        self, store_id: int, *, include_inactive: bool = False, query: str | None = None,
+    ) -> list[InventoryItem]:
         self.require_store(store_id)
-        return self.storage.list_items(store_id, include_inactive=include_inactive)
+        return self.storage.list_items(store_id, include_inactive=include_inactive, query=query)
 
     def find_item(self, store_id: int, query: str) -> InventoryItem | None:
         self.require_store(store_id)
@@ -84,6 +86,9 @@ class InventoryService:
         unit: str | None = None,
         min_quantity: float | None = None,
         min_unit: str | None = None,
+        *,
+        description: str | None = None,
+        synonyms: list[str] | None = None,
     ) -> InventoryItem:
         """Add stock, preserving an active matching item's unit.
 
@@ -91,7 +96,10 @@ class InventoryService:
         partial match. Re-adding an archived exact name starts its stock anew,
         as Storage.add_or_update_item does; restore_item preserves old stock.
         """
-        return self._add_item(store_id, name, quantity, unit, min_quantity, min_unit, match_existing=True)
+        return self._add_item(
+            store_id, name, quantity, unit, min_quantity, min_unit,
+            match_existing=True, description=description, synonyms=synonyms,
+        )
 
     def create_item(
         self,
@@ -101,6 +109,9 @@ class InventoryService:
         unit: str | None = None,
         min_quantity: float | None = None,
         min_unit: str | None = None,
+        *,
+        description: str | None = None,
+        synonyms: list[str] | None = None,
     ) -> InventoryItem:
         """Create a distinct item; exact names, including archived ones, exist already.
 
@@ -112,7 +123,10 @@ class InventoryService:
         normalized = normalize_name(name)
         if any(item.normalized_name == normalized for item in self.storage.list_items(store_id, include_inactive=True)):
             raise ValueError("Позиция с таким названием уже есть на складе.")
-        return self._add_item(store_id, name, quantity, unit, min_quantity, min_unit, match_existing=False)
+        return self._add_item(
+            store_id, name, quantity, unit, min_quantity, min_unit,
+            match_existing=False, description=description, synonyms=synonyms,
+        )
 
     def _add_item(
         self,
@@ -124,6 +138,8 @@ class InventoryService:
         min_unit: str | None,
         *,
         match_existing: bool,
+        description: str | None = None,
+        synonyms: list[str] | None = None,
     ) -> InventoryItem:
         self.require_store(store_id)
         name = clean_name(name)
@@ -141,8 +157,51 @@ class InventoryService:
         elif min_unit is not None:
             raise ValueError("Укажите минимальное количество вместе с единицей.")
         return self.storage.add_or_update_item(
-            store_id, self.chat_id, existing.name if existing else name, quantity, target_unit, minimum
+            store_id, self.chat_id, existing.name if existing else name, quantity, target_unit, minimum,
+            description=description, synonyms=synonyms,
         )
+
+    def update_item(
+        self,
+        item_id: int,
+        *,
+        name: str | None = None,
+        quantity: float | None = None,
+        unit: str | None = None,
+        min_quantity: float | None = None,
+        min_unit: str | None = None,
+        description: str | None = None,
+        synonyms: list[str] | None = None,
+    ) -> InventoryItem:
+        """Patch one active item atomically; omitted fields keep their values.
+
+        Units describe supplied amounts; the stored item's unit is preserved.
+        An empty description or synonym list clears that field.
+        """
+        item = self.require_item(item_id, active=True)
+        if all(value is None for value in (name, quantity, min_quantity, description, synonyms)):
+            raise ValueError("Укажите хотя бы одно поле для обновления позиции.")
+        if unit is not None and quantity is None and min_quantity is None:
+            raise ValueError("Укажите количество или минимум вместе с единицей.")
+        if min_unit is not None and min_quantity is None:
+            raise ValueError("Укажите минимальное количество вместе с единицей.")
+        updated_quantity = (
+            converted_quantity(quantity, unit if unit is not None else item.unit, item.unit)
+            if quantity is not None else None
+        )
+        updated_minimum = None
+        if min_quantity is not None:
+            source_unit = min_unit if min_unit is not None else unit if unit is not None else item.unit
+            updated_minimum = converted_quantity(min_quantity, source_unit, item.unit)
+        return require_updated(self.storage.update_item(
+            item.store_id, self.chat_id, item.id,
+            name=clean_name(name) if name is not None else None,
+            quantity=updated_quantity,
+            min_quantity=updated_minimum,
+            description=description,
+            synonyms=synonyms,
+            expected_unit=item.unit,
+        ))
 
     def change_quantity(self, item_id: int, delta: float, unit: str | None = None) -> InventoryItem:
         item = self.require_item(item_id, active=True)

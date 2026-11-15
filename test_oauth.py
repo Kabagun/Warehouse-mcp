@@ -123,7 +123,8 @@ async def test_sdk_discovery_dcr_consent_pkce_and_restart(client, provider):
     registration = await register(client)
     result, code, page = await tokens(client, provider, registration)
     assert result["scope"] == "inventory" and result["expires_in"] == mcp_oauth.ACCESS_TTL
-    assert len(re.findall(r"<li>", page.text)) == 14
+    assert len(re.findall(r"<li>", page.text)) == 15
+    assert "Обновлять товары, их описания и синонимы" in page.text
     assert "Просматривать последствия удаления" in page.text
     assert "Удалять подтверждённые позиции, склады и дома вместе с их содержимым" in page.text
     assert "Разрешить доступ" in page.text and "Отказать" in page.text

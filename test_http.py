@@ -23,6 +23,7 @@ TOKEN = "synthetic-test-bearer-token-1234567890"
 BASE_URL = "https://inventory.example.test"
 TOOL_NAMES = {
     "list_households", "create_household", "list_stores", "create_store", "list_items", "add_item",
+    "update_item",
     "change_item_quantity", "set_item_quantity", "set_item_minimum", "archive_item", "restore_item", "shopping_list",
     "preview_deletion", "delete_item", "delete_store", "delete_household",
 }
@@ -127,6 +128,27 @@ async def test_http_deletion_uses_preview_across_stateless_clients_and_strict_co
             assert receipt["deleted"] is True and receipt["active_items"] == 1
             assert (await reconnected.call_tool("delete_item", {**arguments, "confirmed": True})).is_error
     assert storage.get_item(item["id"]) is None
+
+
+@pytest.mark.anyio
+async def test_http_metadata_search_and_general_update_persist_across_clients(app, inventory):
+    storage, _, store, *_ = inventory
+    async with http_client(app, headers={"Authorization": f"Bearer {TOKEN}"}) as http:
+        async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as connected:
+            item = await call(
+                connected, "add_item", store_id=store.id, name="Synthetic stock", quantity=2,
+                description="Для кладовой", synonyms=["Запас"],
+            )
+            updated = await call(
+                connected, "update_item", item_id=item["id"],
+                description="Для кухни", synonyms=["Бакалея"], min_quantity=3,
+            )
+        async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as reconnected:
+            found = await call(reconnected, "list_items", store_id=store.id, query="КУХНИ бакалея")
+            assert found["items"] == [updated]
+            assert updated["quantity"] == 2 and updated["min_quantity"] == 3
+    persisted = Storage(storage.path).get_item(item["id"])
+    assert persisted.notes == "Для кухни" and persisted.synonyms == ("Бакалея",)
 
 
 @pytest.mark.anyio
@@ -235,7 +257,7 @@ async def test_valid_token_still_requires_trusted_host_and_origin(app, inventory
 async def test_explicit_trusted_origin_works_without_cors_or_oauth_discovery(app):
     async with http_client(app, headers={"Authorization": f"bEaReR {TOKEN}", "Origin": BASE_URL}) as http:
         async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as connected:
-            assert len((await connected.list_tools()).tools) == 16
+            assert len((await connected.list_tools()).tools) == 17
         discovery = await http.get("/.well-known/oauth-protected-resource")
         assert discovery.status_code == 404
         assert "access-control-allow-origin" not in discovery.headers

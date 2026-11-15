@@ -56,7 +56,7 @@ async def test_complete_public_oauth_flow_opens_scoped_mcp_and_keeps_static_bear
         http.headers["Authorization"] = "Bearer " + issued["access_token"]
         async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
             assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
-            assert len(TOOL_NAMES) == 16
+            assert len(TOOL_NAMES) == 17
             assert await call(connected, "list_households") == {
                 "households": [{"id": home.id, "name": "Synthetic home"}],
             }
@@ -154,7 +154,7 @@ async def test_refresh_preserves_existing_access_and_revocation_invalidates_fami
             assert denied.status_code == 401
         http.headers["Authorization"] = "Bearer " + TOKEN
         async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
-            assert len((await connected.list_tools()).tools) == 16
+            assert len((await connected.list_tools()).tools) == 17
 
 
 @pytest.mark.anyio

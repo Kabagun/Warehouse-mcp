@@ -97,6 +97,7 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     by_name = {tool.name: tool for tool in tools}
     assert set(by_name) == {
         "list_households", "create_household", "list_stores", "create_store", "list_items", "add_item",
+        "update_item",
         "change_item_quantity", "set_item_quantity", "set_item_minimum", "archive_item", "restore_item", "shopping_list",
         "preview_deletion", "delete_item", "delete_store", "delete_household",
     }
@@ -111,6 +112,11 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     assert by_name["add_item"].annotations.idempotent_hint is False
     assert by_name["change_item_quantity"].annotations.destructive_hint is True
     assert by_name["set_item_quantity"].annotations.idempotent_hint is True
+    assert by_name["update_item"].annotations.idempotent_hint is True
+    assert "set_item_description" not in by_name and "set_item_synonyms" not in by_name
+    assert set(by_name["update_item"].input_schema["required"]) == {"item_id"}
+    assert {"description", "synonyms"} <= set(by_name["add_item"].input_schema["properties"])
+    assert "query" in by_name["list_items"].input_schema["properties"]
     assert by_name["archive_item"].annotations.destructive_hint is True
     assert by_name["restore_item"].annotations.idempotent_hint is True
     assert set(by_name["create_store"].input_schema["properties"]) == {"household_id", "name"}
@@ -136,7 +142,7 @@ async def test_profile_tool_is_flat_strict_readonly_and_uses_configured_identity
     before = storage.path.read_bytes()
     async with Client(build_server(storage, 101, profile_id=PROFILE_ID)) as connected:
         tools = (await connected.list_tools()).tools
-        assert len(tools) == 17
+        assert len(tools) == 18
         profile_tool = next(tool for tool in tools if tool.name == "get_profile")
         assert profile_tool.meta == {"openai/profile": True, "securitySchemes": [{"type": "oauth2", "scopes": ["inventory"]}]}
         assert profile_tool.input_schema["properties"] == {}
@@ -227,6 +233,90 @@ async def test_add_change_set_minimum_and_shopping_use_same_units(client, invent
 
 
 @pytest.mark.anyio
+async def test_item_metadata_creation_search_general_edit_and_clearing(client, inventory):
+    storage, home, store, *_ = inventory
+    item = await call(
+        client, "add_item", store_id=store.id, name="Контейнер", quantity=2, min_quantity=1,
+        description="Для заморозки супа", synonyms=["Бокс", " бокс ", "Пищевой лоток"],
+    )
+    assert item["description"] == "Для заморозки супа"
+    assert item["synonyms"] == ["Бокс", "Пищевой лоток"]
+    for query in ("ЗАМОРОЗКИ", "бОкС", "супа лоток", "контейнер бокс"):
+        found = await call(client, "list_items", store_id=store.id, query=query)
+        assert [row["id"] for row in found["items"]] == [item["id"]]
+    updated = await call(
+        client, "update_item", item_id=item["id"], name="Контейнер большой",
+        description="Для круп", synonyms=["Банка"],
+    )
+    assert (updated["quantity"], updated["min_quantity"], updated["unit"]) == (2, 1, "шт")
+    assert (updated["description"], updated["synonyms"]) == ("Для круп", ["Банка"])
+    assert (await call(client, "list_items", store_id=store.id, query="заморозки"))["items"] == []
+    assert (await call(client, "list_items", store_id=store.id, query="банка"))["items"][0] == updated
+    unchanged = await call(client, "update_item", item_id=item["id"], description=None, quantity=2)
+    assert unchanged == updated
+    cleared = await call(client, "update_item", item_id=item["id"], description="", synonyms=[])
+    assert cleared["description"] == "" and cleared["synonyms"] == []
+    assert storage.get_item(item["id"]).quantity == 2
+
+
+@pytest.mark.anyio
+async def test_general_update_converts_amounts_and_rolls_back_invalid_metadata(client, inventory):
+    storage, _, store, *_ = inventory
+    item = await call(client, "add_item", store_id=store.id, name="Flour", quantity=2, unit="кг")
+    item = await call(
+        client, "update_item", item_id=item["id"], quantity=500, unit="г",
+        min_quantity=200, min_unit="г", description="Synthetic baking flour", synonyms=["Мука"],
+    )
+    assert (item["quantity"], item["min_quantity"], item["unit"]) == (0.5, 0.2, "кг")
+    assert item["description"] == "Synthetic baking flour"
+    for patch in (
+        {}, {"description": None}, {"unit": "г"}, {"min_unit": "г"},
+        {"quantity": 4, "synonyms": [" "]},
+        {"quantity": 4, "synonyms": [False]},
+        {"quantity": 4, "synonyms": "flour"},
+        {"quantity": 4, "description": "x" * 4001},
+        {"quantity": 4, "synonyms": ["x" * 201]},
+        {"quantity": 4, "synonyms": [str(i) for i in range(51)]},
+        {"quantity": True}, {"quantity": -1}, {"quantity": 1, "unit": "л"},
+        {"description": "changed", "chat_id": 202},
+    ):
+        result = await client.call_tool("update_item", {"item_id": item["id"], **patch})
+        assert result.is_error, patch
+        current = storage.get_item(item["id"])
+        assert (current.quantity, current.min_quantity, current.notes, current.synonyms) == (
+            0.5, 0.2, "Synthetic baking flour", ("Мука",),
+        )
+    before = storage.get_item(item["id"])
+    assert (await client.call_tool("add_item", {
+        "store_id": store.id, "name": "Flour", "quantity": 10, "synonyms": [" "],
+    })).is_error
+    assert storage.get_item(item["id"]) == before
+
+
+@pytest.mark.anyio
+async def test_search_is_universal_scoped_and_keeps_distinct_stock(client, inventory):
+    storage, home, store, other_home, other_store, *_ = inventory
+    freezer = await call(client, "create_store", household_id=home.id, name="Synthetic freezer")
+    for store_id, name in ((store.id, "Kitchen box"), (freezer["id"], "Frozen box")):
+        item = await call(
+            client, "add_item", store_id=store_id, name=name, quantity=3,
+            description="Для хранения", synonyms=["Контейнер"],
+        )
+        another = await call(
+            client, "add_item", store_id=store_id, name="Separate stock", quantity=7,
+            synonyms=["Контейнер"],
+        )
+        found = await call(client, "list_items", store_id=store_id, query="контейнер")
+        assert {row["id"] for row in found["items"]} == {item["id"], another["id"]}
+        assert sum(row["quantity"] for row in found["items"]) == 10
+        await call(client, "archive_item", item_id=item["id"])
+        assert len((await call(client, "list_items", store_id=store_id, query="контейнер"))["items"]) == 1
+        assert len((await call(client, "list_items", store_id=store_id, query="контейнер", include_archived=True))["items"]) == 2
+    denied = await client.call_tool("list_items", {"store_id": other_store.id, "query": "Other"})
+    assert denied.is_error
+
+
+@pytest.mark.anyio
 async def test_archived_items_require_restore_and_keep_stock(client, inventory):
     _, home, store, *_ = inventory
     item = await call(client, "add_item", store_id=store.id, name="Milk", quantity=0.5, unit="л", min_quantity=1)
@@ -241,6 +331,7 @@ async def test_archived_items_require_restore_and_keep_stock(client, inventory):
         ("change_item_quantity", {"delta": 1}),
         ("set_item_quantity", {"quantity": 1}),
         ("set_item_minimum", {"min_quantity": 1}),
+        ("update_item", {"description": "Synthetic archived edit"}),
     ):
         result = await client.call_tool(tool, {"item_id": item_id, **args})
         assert result.is_error
@@ -336,6 +427,7 @@ async def test_every_tool_scopes_foreign_ids_to_membership(client, inventory):
         ("change_item_quantity", {"item_id": other_item.id, "delta": -1}),
         ("set_item_quantity", {"item_id": other_item.id, "quantity": 0}),
         ("set_item_minimum", {"item_id": other_item.id, "min_quantity": 5}),
+        ("update_item", {"item_id": other_item.id, "description": "Intruder", "synonyms": ["Hidden"]}),
         ("archive_item", {"item_id": other_item.id}),
         ("restore_item", {"item_id": other_item.id}),
         ("preview_deletion", {"target_type": "item", "target_id": other_item.id}),
@@ -431,7 +523,7 @@ async def test_stdio_initialization_discovery_and_call(inventory, mode):
     async with Client(parameters, mode=mode) as connected:
         names = {tool.name for tool in (await connected.list_tools()).tools}
         assert "add_item" in names and "shopping_list" in names
-        assert len(names) == 16
+        assert len(names) == 17
         assert {"preview_deletion", "delete_item", "delete_store", "delete_household"} <= names
         homes = await call(connected, "list_households")
         assert homes["households"][0]["id"] == home.id

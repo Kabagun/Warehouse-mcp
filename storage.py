@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import secrets
 import sqlite3
@@ -20,9 +21,37 @@ from storage_types import (
 
 
 def _validate_amount(value: float, field: str, *, signed: bool = False) -> None:
-    if not math.isfinite(value) or (not signed and value < 0):
+    try:
+        valid = (not isinstance(value, bool) and isinstance(value, (int, float))
+                 and math.isfinite(value) and (signed or value >= 0))
+    except OverflowError:
+        valid = False
+    if not valid:
         qualifier = "finite" if signed else "finite and nonnegative"
         raise ValueError(f"{field} must be {qualifier}")
+
+
+def _validate_description(description: str | None) -> None:
+    if description is not None and (not isinstance(description, str) or len(description) > 4000):
+        raise ValueError("description must be a string of at most 4000 characters")
+
+
+def _clean_synonyms(synonyms: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if synonyms is None:
+        return None
+    if not isinstance(synonyms, (list, tuple)) or len(synonyms) > 50:
+        raise ValueError("synonyms must be an array of at most 50 strings")
+    result: list[str] = []
+    seen: set[str] = set()
+    for synonym in synonyms:
+        if not isinstance(synonym, str) or len(synonym) > 200 or not synonym.strip():
+            raise ValueError("each synonym must be a nonblank string of at most 200 characters")
+        clean = " ".join(synonym.split())
+        normalized = normalize_name(clean)
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(clean)
+    return tuple(result)
 
 
 class Storage:
@@ -96,6 +125,7 @@ class Storage:
                     """
                 )
                 self._migrate_inventory_items(connection)
+                self._ensure_column(connection, "inventory_items", "synonyms", "TEXT NOT NULL DEFAULT '[]'")
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS item_events (
@@ -489,25 +519,32 @@ class Storage:
         quantity: float,
         unit: str,
         min_quantity: float | None = None,
+        *,
+        description: str | None = None,
+        synonyms: list[str] | tuple[str, ...] | None = None,
     ) -> InventoryItem:
         _validate_amount(quantity, "quantity")
         if min_quantity is not None:
             _validate_amount(min_quantity, "min_quantity")
+        _validate_description(description)
+        clean_synonyms = _clean_synonyms(synonyms)
         normalized_name = normalize_name(name)
         clean_name = " ".join(name.split())
         clean_unit = unit.strip() or "шт"
         minimum = 1.0 if min_quantity is None else min_quantity
         with closing(self._connect()) as connection:
             with connection:
+                connection.execute("BEGIN IMMEDIATE")
                 store = self._get_store(connection, store_id)
                 if store is None or not self._is_member(connection, store.household_id, chat_id):
                     raise KeyError(f"Store {store_id} does not exist")
                 connection.execute(
                     """
                     INSERT INTO inventory_items (
-                        household_id, store_id, name, normalized_name, quantity, unit, min_quantity, active
+                        household_id, store_id, name, normalized_name, quantity, unit, min_quantity, active,
+                        notes, synonyms
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     ON CONFLICT(store_id, normalized_name) DO UPDATE SET
                         name = excluded.name,
                         quantity = CASE
@@ -519,10 +556,14 @@ class Storage:
                             WHEN ? IS NULL THEN inventory_items.min_quantity
                             ELSE excluded.min_quantity
                         END,
+                        notes = CASE WHEN ? IS NULL THEN inventory_items.notes ELSE excluded.notes END,
+                        synonyms = CASE WHEN ? IS NULL THEN inventory_items.synonyms ELSE excluded.synonyms END,
                         active = 1,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (store.household_id, store_id, clean_name, normalized_name, quantity, clean_unit, minimum, min_quantity),
+                    (store.household_id, store_id, clean_name, normalized_name, quantity, clean_unit, minimum,
+                     description, json.dumps(clean_synonyms or (), ensure_ascii=False), min_quantity,
+                     description, None if clean_synonyms is None else 1),
                 )
                 item = self._get_item_by_name(connection, store_id, normalized_name)
                 _validate_amount(item.quantity, "resulting quantity")
@@ -531,6 +572,80 @@ class Storage:
                     (item.id, chat_id, quantity),
                 )
                 return item
+
+    def update_item(
+        self,
+        store_id: int,
+        chat_id: int,
+        item_id: int,
+        *,
+        name: str | None = None,
+        quantity: float | None = None,
+        min_quantity: float | None = None,
+        description: str | None = None,
+        synonyms: list[str] | tuple[str, ...] | None = None,
+        expected_unit: str | None = None,
+    ) -> InventoryItem | None:
+        """Apply one absolute item patch, with one audit event and no partial writes."""
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ValueError("name must be a nonblank string")
+        clean_name = " ".join(name.split()) if name is not None else None
+        if quantity is not None:
+            _validate_amount(quantity, "quantity")
+        if min_quantity is not None:
+            _validate_amount(min_quantity, "min_quantity")
+        _validate_description(description)
+        clean_synonyms = _clean_synonyms(synonyms)
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                item = self._get_item(connection, item_id)
+                if (item is None or item.store_id != store_id
+                        or not self._is_member(connection, item.household_id, chat_id)):
+                    return None
+                store = self._get_store(connection, store_id)
+                if store is None or store.household_id != item.household_id:
+                    return None
+                if not item.active:
+                    raise ValueError("Archived items must be restored before editing")
+                if expected_unit is not None and expected_unit != item.unit:
+                    raise ValueError("Item unit changed; refresh the item before editing")
+                updates: dict[str, object] = {}
+                changed_fields: list[str] = []
+                for field, value, current in (
+                    ("name", clean_name, item.name),
+                    ("quantity", quantity, item.quantity),
+                    ("min_quantity", min_quantity, item.min_quantity),
+                    ("description", description, item.notes),
+                    ("synonyms", clean_synonyms, item.synonyms),
+                ):
+                    if value is None or value == current:
+                        continue
+                    changed_fields.append(field)
+                    if field == "name":
+                        normalized_name = normalize_name(value)
+                        collision = connection.execute(
+                            "SELECT id FROM inventory_items WHERE store_id = ? AND normalized_name = ? AND id != ?",
+                            (store_id, normalized_name, item_id),
+                        ).fetchone()
+                        if collision is not None:
+                            raise ValueError("An item with that name already exists in this store")
+                        updates["normalized_name"] = normalized_name
+                    column = "notes" if field == "description" else field
+                    updates[column] = json.dumps(value, ensure_ascii=False) if field == "synonyms" else value
+                if not updates:
+                    return item
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                connection.execute(
+                    f"UPDATE inventory_items SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (*updates.values(), item_id),
+                )
+                connection.execute(
+                    "INSERT INTO item_events (item_id, chat_id, action, delta, note) VALUES (?, ?, 'update', ?, ?)",
+                    (item_id, chat_id, None if quantity is None else quantity - item.quantity,
+                     "Changed fields: " + ", ".join(changed_fields)),
+                )
+                return self._get_item(connection, item_id)
 
     def set_item_quantity(self, store_id: int, chat_id: int, item_id: int, quantity: float) -> InventoryItem | None:
         _validate_amount(quantity, "quantity")
@@ -759,15 +874,26 @@ class Storage:
         with closing(self._connect()) as connection:
             return self._get_item(connection, item_id)
 
-    def list_items(self, store_id: int, include_inactive: bool = False) -> list[InventoryItem]:
-        query = "SELECT * FROM inventory_items WHERE store_id = ?"
+    def list_items(
+        self, store_id: int, include_inactive: bool = False, query: str | None = None,
+    ) -> list[InventoryItem]:
+        words = normalize_name(query).split() if query is not None else []
+        sql = "SELECT * FROM inventory_items WHERE store_id = ?"
         params: list[object] = [store_id]
         if not include_inactive:
-            query += " AND active = 1"
-        query += " ORDER BY active DESC, normalized_name"
+            sql += " AND active = 1"
+        sql += " ORDER BY active DESC, normalized_name"
         with closing(self._connect()) as connection:
-            rows = connection.execute(query, params).fetchall()
-            return [self._row_to_item(row) for row in rows]
+            rows = connection.execute(sql, params).fetchall()
+            items = [self._row_to_item(row) for row in rows]
+            if not words:
+                return items
+            result = []
+            for item in items:
+                searchable = normalize_name(" ".join((item.name, item.notes or "", *item.synonyms)))
+                if all(word in searchable for word in words):
+                    result.append(item)
+            return result
 
     def low_items(self, store_id: int) -> list[InventoryItem]:
         with closing(self._connect()) as connection:
@@ -1156,6 +1282,7 @@ class Storage:
             active=bool(row["active"]),
             notes=row["notes"],
             updated_at=row["updated_at"],
+            synonyms=tuple(json.loads(row["synonyms"])),
         )
 
     def _row_to_user(self, row: sqlite3.Row) -> User:

@@ -34,6 +34,7 @@ class InventoryItem:
     active: bool
     notes: str | None
     updated_at: str
+    synonyms: tuple[str, ...] = ()
 
     @property
     def is_low(self) -> bool:
