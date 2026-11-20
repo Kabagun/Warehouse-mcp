@@ -47,7 +47,7 @@ MCP-сервер для учёта домашних запасов. Подклю
 Требуется Python 3.11 или новее. Пример для PowerShell 7:
 
 ```powershell
-git switch mcp-only
+git switch master
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
@@ -171,9 +171,9 @@ OAuth-состояние хранится отдельно от запасов �
 
 | Ветка | Версия |
 | --- | --- |
-| `mcp-only` | Самостоятельный MCP-сервер, основная версия проекта |
-| `main` | Исходный Telegram-бот |
-| `telegram-bot` | Обновлённый Telegram-бот с дополнительным MCP |
+| `master` | Самостоятельный MCP-сервер, основная версия проекта |
+| `bot` | Обновлённый Telegram-бот с дополнительным MCP |
+| `bot-legacy` | Исходный Telegram-бот |
 
 Для переключения используйте `git switch <ветка>`. У каждой версии должен быть свой путь к базе SQLite. Переключение ветки не откатывает изменения схемы или данных.
 
